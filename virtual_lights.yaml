@@ -1,0 +1,474 @@
+# =============================================================================
+#  packages/virtual_lights.yaml
+#  Self-learning virtual power sensors for unmetered wall switches
+#
+#  UNTESTED. Run Developer Tools > YAML > Check configuration, then turn on
+#  input_boolean.lw_debug and watch the Logbook for the first few switch events.
+#
+#  How it works
+#   1. A switch turns ON or OFF  -> automation.lw_dispatch starts script.lw_learn
+#   2. The script records the reference meter ("before"), waits for things to
+#      settle, reads it twice more, and computes the delta.
+#   3. The sample is rejected if: readings are unstable, a sibling switch or
+#      guard sensor changed nearby in time, or the delta is outside min/max.
+#   4. Valid samples go into a rolling history of the last 5 (input_text).
+#      The MEDIAN of the history is the learned watts (input_number).
+#      A swapped bulb takes over after ~3 new samples, no manual reset needed.
+#   5. Template power sensor = learned watts while the switch is ON.
+#      Riemann sum sensors turn that into kWh for the Energy Dashboard.
+#
+#  Reference meters
+#   b2  = sensor.light_fan_light_fan_power   (Shelly PM mini, Bedroom 2 light+fan)
+#   ctb = sensor.lights_ctb_net_power        (CT B minus all known metered loads)
+#
+#  To add another unmetered switch you edit, in this file:
+#   - helpers (input_text + input_number, named lw_<key>_samples / lw_<key>_watts)
+#   - script.lw_learn: add it under `lights:` and add it to its meter's `switches`
+#   - automation.lw_dispatch: add it to the trigger entity list
+#   - a template power sensor + an integration sensor
+#
+#  Design notes
+#   - Each input_number max (200) must stay above every `max` under `lights:`.
+#     HA raises an error on out-of-range set_value (it does not clamp).
+#   - Manual edits to input_number.lw_*_watts are overwritten by the next
+#     accepted sample. To override, edit the lw_*_samples history instead.
+#   - Samples are rejected if another switch on the same meter changed up to
+#     10 s BEFORE this one (meter lag makes `before` unreliable). Scenes that
+#     toggle several lights close together therefore teach nothing. Intended.
+#   - max_sub_interval on the energy sensors is deliberate: without it a long
+#     ON period is booked in one lump when the light turns off, which skews
+#     the hourly Energy Dashboard bars.
+# =============================================================================
+
+input_boolean:
+  lw_debug:
+    name: "Learned Watts - debug logbook"
+    icon: mdi:bug
+
+# Rolling sample history per learned switch ("12.1;12.3;11.9", max 5 values)
+input_text:
+  lw_b2_light_samples:
+    name: "LW Bedroom 2 Light samples"
+    max: 255
+  lw_b1_main_samples:
+    name: "LW Bedroom 1 Main Light samples"
+    max: 255
+  lw_b1_secondary_samples:
+    name: "LW Bedroom 1 Secondary Light samples"
+    max: 255
+  lw_b1_fan_samples:
+    name: "LW Bedroom 1 Fan samples"
+    max: 255
+
+# Learned watts (median of the history above)
+input_number:
+  lw_b2_light_watts:
+    name: "LW Bedroom 2 Light watts"
+    min: 0
+    max: 200
+    step: 0.1
+    mode: box
+    unit_of_measurement: W
+  lw_b1_main_watts:
+    name: "LW Bedroom 1 Main Light watts"
+    min: 0
+    max: 200
+    step: 0.1
+    mode: box
+    unit_of_measurement: W
+  lw_b1_secondary_watts:
+    name: "LW Bedroom 1 Secondary Light watts"
+    min: 0
+    max: 200
+    step: 0.1
+    mode: box
+    unit_of_measurement: W
+  lw_b1_fan_watts:
+    name: "LW Bedroom 1 Fan watts"
+    min: 0
+    max: 200
+    step: 0.1
+    mode: box
+    unit_of_measurement: W
+
+# -----------------------------------------------------------------------------
+#  Learning script
+# -----------------------------------------------------------------------------
+script:
+  lw_learn:
+    alias: "Learned Watts - learn one sample"
+    icon: mdi:flash-auto
+    mode: parallel
+    max: 20
+    fields:
+      target_switch:
+        description: "Switch that just changed"
+        required: true
+        selector:
+          entity:
+            domain: switch
+      direction:
+        description: "New state of that switch"
+        required: true
+        selector:
+          select:
+            options: ["on", "off"]
+
+    variables:
+      # ---- Reference meters --------------------------------------------------
+      # switches: EVERY switch whose load is behind this meter, learned or not,
+      #           metered or not. A change on any of them near the sample window
+      #           discards the sample (crosstalk guard).
+      # guards:   sensors that, if ON or recently changed, discard the sample.
+      # tol:      max allowed difference (W) between the two "after" readings.
+      meters:
+        b2:
+          ref: sensor.light_fan_light_fan_power
+          tol: 1.0
+          switches:
+            - switch.bedroom_2_wall_switch_light
+            - switch.bedroom_2_wall_switch_fan
+          guards: []
+        ctb:
+          ref: sensor.lights_ctb_net_power
+          tol: 3.0
+          switches:
+            - switch.bedroom_wall_switch_main_light
+            - switch.bedroom_wall_switch_secondary_light
+            - switch.bedroom_wall_switch_fan
+            # Bedroom 2 is subtracted from CT B using its own meter, but the two
+            # meters update at different moments, which makes a short glitch.
+            # Keep them here so those toggles block CT B samples.
+            - switch.bedroom_2_wall_switch_light
+            - switch.bedroom_2_wall_switch_fan
+            # TODO: add every other wall switch on CT B here (even before you
+            #       create virtual sensors for them).
+          guards:
+            - binary_sensor.water_heater_estatus
+            - binary_sensor.microwave_estatus
+
+      # ---- Learned switches --------------------------------------------------
+      # key    -> helpers input_text.lw_<key>_samples / input_number.lw_<key>_watts
+      # min/max-> accepted delta range in W (min should sit above meter noise)
+      # settle -> seconds to wait before the first "after" reading
+      # tol    -> optional per-switch override of the meter tolerance
+      lights:
+        switch.bedroom_2_wall_switch_light:
+          key: b2_light
+          meter: b2
+          min: 2
+          max: 80
+          settle: 6
+        switch.bedroom_wall_switch_main_light:
+          key: b1_main
+          meter: ctb
+          min: 3
+          max: 80
+          settle: 6
+        switch.bedroom_wall_switch_secondary_light:
+          key: b1_secondary
+          meter: ctb
+          min: 3
+          max: 80
+          settle: 6
+        # DC fan with remote: turn-ON usually shows only standby (<3 W) and is
+        # rejected by min. Turn-OFF while running gives the useful samples.
+        switch.bedroom_wall_switch_fan:
+          key: b1_fan
+          meter: ctb
+          min: 3
+          max: 60
+          settle: 10
+          tol: 4.0
+
+    sequence:
+      - variables:
+          cfg: "{{ lights.get(target_switch) }}"
+      - condition: template
+        value_template: "{{ cfg is not none }}"
+
+      - variables:
+          m: "{{ meters[cfg['meter']] }}"
+          ref: "{{ m['ref'] }}"
+          helper_text: "input_text.lw_{{ cfg['key'] }}_samples"
+          helper_num: "input_number.lw_{{ cfg['key'] }}_watts"
+          others: "{{ m['switches'] | reject('eq', target_switch) | list }}"
+          t0: "{{ now().timestamp() }}"
+          before: "{{ states(ref) | float(0) }}"
+      - condition: template
+        value_template: "{{ has_value(ref) }}"
+
+      # Wait for inrush / driver / motor to settle, then read twice
+      - delay:
+          seconds: "{{ cfg.get('settle', 6) | int }}"
+      - variables:
+          a1: "{{ states(ref) | float(0) }}"
+      - delay: "00:00:03"
+      - variables:
+          a2: "{{ states(ref) | float(0) }}"
+          after: "{{ (a1 + a2) / 2 }}"
+          sample: >
+            {{ ((after - before) if direction == 'on' else (before - after)) | round(1) }}
+          tol: "{{ cfg.get('tol', m['tol']) }}"
+          stable: "{{ (a2 - a1) | abs <= tol }}"
+          # Must still be in the new state AND must not have changed since the
+          # script started (catches on-off-on flicker and unavailable-and-back).
+          still_same: >
+            {{ is_state(target_switch, direction)
+               and states[target_switch].last_changed.timestamp() <= t0 }}
+          ref_ok: "{{ has_value(ref) }}"
+          crosstalk: >
+            {% set ns = namespace(hit=false) %}
+            {% for e in others %}
+              {% if states[e] is not none and states[e].last_changed.timestamp() > t0 - 10 %}
+                {% set ns.hit = true %}
+              {% endif %}
+            {% endfor %}
+            {% for g in m['guards'] %}
+              {% if is_state(g, 'on') or (states[g] is not none and states[g].last_changed.timestamp() > t0 - 10) %}
+                {% set ns.hit = true %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.hit }}
+          ok: >
+            {{ ref_ok and still_same and stable
+               and not (crosstalk | bool(false))
+               and cfg['min'] | float(0) <= sample | float(0) <= cfg['max'] | float(0) }}
+
+      - if:
+          - condition: template
+            value_template: "{{ ok }}"
+        then:
+          - variables:
+              hist_old: >
+                {{ states(helper_text).split(';') | select('is_number') | map('float') | list }}
+              hist_new: "{{ (hist_old + [sample])[-5:] }}"
+              sorted_h: "{{ hist_new | sort }}"
+              n: "{{ sorted_h | length }}"
+              median: >
+                {{ (sorted_h[n // 2] if n % 2 == 1
+                    else (sorted_h[n // 2 - 1] + sorted_h[n // 2]) / 2) | round(1) }}
+          - action: input_text.set_value
+            target:
+              entity_id: "{{ helper_text }}"
+            data:
+              value: "{{ hist_new | join(';') }}"
+          - action: input_number.set_value
+            target:
+              entity_id: "{{ helper_num }}"
+            data:
+              value: "{{ median }}"
+
+      - if:
+          - condition: state
+            entity_id: input_boolean.lw_debug
+            state: "on"
+        then:
+          - action: logbook.log
+            data:
+              name: "Learned Watts"
+              entity_id: "{{ target_switch }}"
+              message: >
+                {{ 'ACCEPTED' if ok else 'REJECTED' }} ({{ direction }}):
+                sample={{ sample }}W before={{ before }} a1={{ a1 }} a2={{ a2 }}
+                stable={{ stable }} still_same={{ still_same }}
+                crosstalk={{ crosstalk | bool(false) }}
+                range={{ cfg['min'] }}-{{ cfg['max'] }}
+
+# -----------------------------------------------------------------------------
+#  Dispatcher: one automation for all learned switches
+# -----------------------------------------------------------------------------
+automation:
+  - id: lw_dispatch
+    alias: "Learned Watts - dispatch"
+    description: "Starts the learning script whenever a learned switch toggles"
+    mode: parallel
+    max: 20
+    triggers:
+      - trigger: state
+        entity_id:
+          - switch.bedroom_2_wall_switch_light
+          - switch.bedroom_wall_switch_main_light
+          - switch.bedroom_wall_switch_secondary_light
+          - switch.bedroom_wall_switch_fan
+        from: ["on", "off"]
+        to: ["on", "off"]
+    actions:
+      - action: script.turn_on
+        target:
+          entity_id: script.lw_learn
+        data:
+          variables:
+            target_switch: "{{ trigger.entity_id }}"
+            direction: "{{ trigger.to_state.state }}"
+
+# -----------------------------------------------------------------------------
+#  Template sensors
+# -----------------------------------------------------------------------------
+template:
+  - sensor:
+      # CT B minus every metered load. NOT clamped, NOT baseline-corrected,
+      # so the learner sees real rises and drops.
+      - name: "Lights CTB Net Power"
+        unique_id: lw_ctb_net_power
+        unit_of_measurement: "W"
+        device_class: power
+        state_class: measurement
+        availability: >
+          {{ has_value('sensor.energy_meter_lights_ctb_power')
+             and has_value('sensor.hisense_tugs_power')
+             and has_value('sensor.light_fan_light_fan_power')
+             and has_value('sensor.midea_all_easy_pro_power')
+             and has_value('sensor.midea_celest_power')
+             and has_value('sensor.celest_bedroom_3_power') }}
+        state: >
+          {{ (states('sensor.energy_meter_lights_ctb_power') | float(0)
+              - states('sensor.hisense_tugs_power') | float(0)
+              - states('sensor.light_fan_light_fan_power') | float(0)
+              - states('sensor.midea_all_easy_pro_power') | float(0)
+              - states('sensor.midea_celest_power') | float(0)
+              - states('sensor.celest_bedroom_3_power') | float(0)) | round(1) }}
+
+      # ---------------- Bedroom 2 (metered by PM mini) ----------------
+      - name: "Virtual Bedroom 2 Light Power"
+        unique_id: vp_b2_light_power
+        unit_of_measurement: "W"
+        device_class: power
+        state_class: measurement
+        availability: >
+          {{ has_value('switch.bedroom_2_wall_switch_light')
+             and (is_state('switch.bedroom_2_wall_switch_light', 'off')
+                  or states('input_number.lw_b2_light_watts') | float(0) > 0) }}
+        state: >
+          {{ states('input_number.lw_b2_light_watts') | float(0)
+             if is_state('switch.bedroom_2_wall_switch_light', 'on') else 0 }}
+        attributes:
+          learned_watts: "{{ states('input_number.lw_b2_light_watts') }}"
+          samples: "{{ states('input_text.lw_b2_light_samples').split(';') | select('is_number') | list | count }}"
+
+      # Fan = real meter minus light, so remote speed changes are tracked live.
+      # After a bulb swap the fan reads off by the wattage difference until
+      # ~3 new light samples move the median. The total always matches the meter.
+      - name: "Virtual Bedroom 2 Fan Power"
+        unique_id: vp_b2_fan_power
+        unit_of_measurement: "W"
+        device_class: power
+        state_class: measurement
+        availability: >
+          {{ has_value('switch.bedroom_2_wall_switch_fan')
+             and has_value('sensor.light_fan_light_fan_power')
+             and has_value('sensor.virtual_bedroom_2_light_power') }}
+        state: >
+          {% if is_state('switch.bedroom_2_wall_switch_fan', 'on') %}
+            {{ [states('sensor.light_fan_light_fan_power') | float(0)
+                - states('sensor.virtual_bedroom_2_light_power') | float(0), 0] | max | round(1) }}
+          {% else %}
+            0
+          {% endif %}
+
+      # ---------------- Bedroom 1 (CT B only) ----------------
+      - name: "Virtual Bedroom 1 Main Light Power"
+        unique_id: vp_b1_main_power
+        unit_of_measurement: "W"
+        device_class: power
+        state_class: measurement
+        availability: >
+          {{ has_value('switch.bedroom_wall_switch_main_light')
+             and (is_state('switch.bedroom_wall_switch_main_light', 'off')
+                  or states('input_number.lw_b1_main_watts') | float(0) > 0) }}
+        state: >
+          {{ states('input_number.lw_b1_main_watts') | float(0)
+             if is_state('switch.bedroom_wall_switch_main_light', 'on') else 0 }}
+        attributes:
+          learned_watts: "{{ states('input_number.lw_b1_main_watts') }}"
+          samples: "{{ states('input_text.lw_b1_main_samples').split(';') | select('is_number') | list | count }}"
+
+      - name: "Virtual Bedroom 1 Secondary Light Power"
+        unique_id: vp_b1_secondary_power
+        unit_of_measurement: "W"
+        device_class: power
+        state_class: measurement
+        availability: >
+          {{ has_value('switch.bedroom_wall_switch_secondary_light')
+             and (is_state('switch.bedroom_wall_switch_secondary_light', 'off')
+                  or states('input_number.lw_b1_secondary_watts') | float(0) > 0) }}
+        state: >
+          {{ states('input_number.lw_b1_secondary_watts') | float(0)
+             if is_state('switch.bedroom_wall_switch_secondary_light', 'on') else 0 }}
+        attributes:
+          learned_watts: "{{ states('input_number.lw_b1_secondary_watts') }}"
+          samples: "{{ states('input_text.lw_b1_secondary_samples').split(';') | select('is_number') | list | count }}"
+
+      # Remote-speed DC fan: one typical value (median of observed running power)
+      - name: "Virtual Bedroom 1 Fan Power"
+        unique_id: vp_b1_fan_power
+        unit_of_measurement: "W"
+        device_class: power
+        state_class: measurement
+        availability: >
+          {{ has_value('switch.bedroom_wall_switch_fan')
+             and (is_state('switch.bedroom_wall_switch_fan', 'off')
+                  or states('input_number.lw_b1_fan_watts') | float(0) > 0) }}
+        state: >
+          {{ states('input_number.lw_b1_fan_watts') | float(0)
+             if is_state('switch.bedroom_wall_switch_fan', 'on') else 0 }}
+        attributes:
+          learned_watts: "{{ states('input_number.lw_b1_fan_watts') }}"
+          samples: "{{ states('input_text.lw_b1_fan_samples').split(';') | select('is_number') | list | count }}"
+
+# -----------------------------------------------------------------------------
+#  Energy (Riemann sum, LEFT method suits step-like loads).
+#  If your HA version rejects this YAML form, create the same sensors in
+#  Settings > Devices & services > Helpers > Integration instead.
+# -----------------------------------------------------------------------------
+sensor:
+  - platform: integration
+    source: sensor.virtual_bedroom_2_light_power
+    name: "Virtual Bedroom 2 Light Energy"
+    unique_id: vp_b2_light_energy
+    unit_prefix: k
+    unit_time: h
+    round: 4
+    method: left
+    max_sub_interval:
+      minutes: 5
+  - platform: integration
+    source: sensor.virtual_bedroom_2_fan_power
+    name: "Virtual Bedroom 2 Fan Energy"
+    unique_id: vp_b2_fan_energy
+    unit_prefix: k
+    unit_time: h
+    round: 4
+    method: left
+    max_sub_interval:
+      minutes: 5
+  - platform: integration
+    source: sensor.virtual_bedroom_1_main_light_power
+    name: "Virtual Bedroom 1 Main Light Energy"
+    unique_id: vp_b1_main_energy
+    unit_prefix: k
+    unit_time: h
+    round: 4
+    method: left
+    max_sub_interval:
+      minutes: 5
+  - platform: integration
+    source: sensor.virtual_bedroom_1_secondary_light_power
+    name: "Virtual Bedroom 1 Secondary Light Energy"
+    unique_id: vp_b1_secondary_energy
+    unit_prefix: k
+    unit_time: h
+    round: 4
+    method: left
+    max_sub_interval:
+      minutes: 5
+  - platform: integration
+    source: sensor.virtual_bedroom_1_fan_power
+    name: "Virtual Bedroom 1 Fan Energy"
+    unique_id: vp_b1_fan_energy
+    unit_prefix: k
+    unit_time: h
+    round: 4
+    method: left
+    max_sub_interval:
+      minutes: 5
