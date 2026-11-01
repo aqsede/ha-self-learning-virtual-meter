@@ -1,3 +1,5 @@
+# Heavily personalized for personal consumption
+
 # Self-Learning Virtual Power Sensors for Unmetered Switches
 
 A Home Assistant package that turns plain wall switches into virtual power and energy sensors. It watches what happens on an upstream meter when a switch toggles, learns the load's wattage from that, and keeps learning, so swapping a bulb corrects itself without any manual reset.
